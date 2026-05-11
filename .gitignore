@@ -53,6 +53,7 @@ Thumbs.db
 .streamlit/secrets.toml
 
 docs/
+ignore/
 .claude/
 BUILD_PLAN.md
 CONTEXT.md
