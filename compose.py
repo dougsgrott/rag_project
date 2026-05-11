@@ -10,6 +10,7 @@ CLI:
     python compose.py set-prompt <domain> <prompt> [--author <name>]
     python compose.py ingest <path>
     python compose.py query <conversation_id> <query> [--domain <name>]
+    python compose.py evaluate <test_set.json> [--domain <name>]
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from rag.adapters.openai.generator import OpenAIGenerator
 from rag.adapters.sqlite.conversation_store import SQLiteConversationStore
 from rag.adapters.sqlite.prompt_store import SQLitePromptStore
 from rag.errors import ConfigurationError, RAGError
+from rag.pipeline.evaluate import EvalCase, evaluate_test_set
 from rag.pipeline.ingest import ingest_documents
 from rag.pipeline.query import answer_query
 from rag.settings import Settings
@@ -165,6 +167,78 @@ async def _run_set_prompt(domain: str, prompt: str, author: str) -> None:
     print(f"saved prompt for domain '{domain}' (author: {author})")
 
 
+def _load_eval_cases(path: str) -> list[EvalCase]:
+    """Load a test set from JSON.
+
+    Format: a list of objects with `query` (required) and optional
+    `reference` (string or null). Example:
+
+        [
+          {"query": "What is X?", "reference": "X is ..."},
+          {"query": "Tell me about Y"}
+        ]
+    """
+    import json
+    from pathlib import Path
+
+    text = Path(path).expanduser().read_text(encoding="utf-8")
+    raw = json.loads(text)
+    if not isinstance(raw, list):
+        raise ConfigurationError(
+            f"{path}: expected a JSON list of cases, got {type(raw).__name__}"
+        )
+    cases: list[EvalCase] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict) or "query" not in item:
+            raise ConfigurationError(
+                f"{path}[{i}]: each case must be an object with a `query` field"
+            )
+        cases.append(EvalCase(query=item["query"], reference=item.get("reference")))
+    return cases
+
+
+async def _run_evaluate(
+    cases_path: str,
+    *,
+    domain: str,
+    search_top_k: int,
+    final_top_k: int,
+    per_case: bool,
+) -> None:
+    cases = _load_eval_cases(cases_path)
+    async with build_simple_stack() as s:
+        report = await evaluate_test_set(
+            prompt_store=s.prompt_store,
+            conversation_store=s.conversation_store,
+            query_rewriter=s.query_rewriter,
+            vector_store=s.vector_store,
+            reranker=s.reranker,
+            generator=s.generator,
+            evaluator=s.evaluator,
+            domain=domain,
+            cases=cases,
+            search_top_k=search_top_k,
+            final_top_k=final_top_k,
+        )
+    if per_case:
+        for i, record in enumerate(report.records):
+            print(f"--- case {i + 1}: {record.case.query!r}")
+            print(f"  answer:  {record.answer.content[:200]}")
+            def _fmt(v: float | None) -> str:
+                return f"{v:.3f}" if v is not None else "—"
+
+            print(
+                f"  metrics: "
+                f"F={record.result.faithfulness:.3f} "
+                f"AR={record.result.answer_relevancy:.3f} "
+                f"CP={record.result.context_precision:.3f} "
+                f"CR={_fmt(record.result.context_recall)} "
+                f"AC={_fmt(record.result.answer_correctness)}"
+            )
+            print()
+    print(report)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="compose.py",
@@ -187,6 +261,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_prompt.add_argument("prompt")
     p_prompt.add_argument("--author", default="cli")
 
+    p_eval = sub.add_parser("evaluate", help="Run the offline evaluation pipeline against a JSON test set")
+    p_eval.add_argument("cases_path", help="Path to a JSON file with a list of {query, reference?} objects")
+    p_eval.add_argument("--domain", default="default")
+    p_eval.add_argument("--search-top-k", type=int, default=150)
+    p_eval.add_argument("--final-top-k", type=int, default=5)
+    p_eval.add_argument("--per-case", action="store_true", help="Also print each case's result")
+
     return parser
 
 
@@ -207,6 +288,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.cmd == "set-prompt":
             asyncio.run(_run_set_prompt(args.domain, args.prompt, args.author))
+        elif args.cmd == "evaluate":
+            asyncio.run(
+                _run_evaluate(
+                    args.cases_path,
+                    domain=args.domain,
+                    search_top_k=args.search_top_k,
+                    final_top_k=args.final_top_k,
+                    per_case=args.per_case,
+                )
+            )
     except RAGError as e:
         print(f"{type(e).__name__}: {e}", file=sys.stderr)
         return 2
