@@ -24,6 +24,7 @@ class TestNoOpEvaluator(EvaluatorConformance):
         assert result.answer_relevancy == 0.0
         assert result.context_precision == 0.0
         assert result.context_recall is None
+        assert result.answer_correctness is None
 
     async def test_ignores_reference_when_provided(
         self, evaluator: NoOpEvaluator
@@ -35,3 +36,4 @@ class TestNoOpEvaluator(EvaluatorConformance):
             reference="gold answer",
         )
         assert result.context_recall is None
+        assert result.answer_correctness is None
