@@ -26,7 +26,9 @@ class EvaluatorConformance:
         assert isinstance(result.faithfulness, float)
         assert isinstance(result.answer_relevancy, float)
         assert isinstance(result.context_precision, float)
+        # Reference-dependent metrics may be None when no reference is given.
         assert result.context_recall is None or isinstance(result.context_recall, float)
+        assert result.answer_correctness is None or isinstance(result.answer_correctness, float)
 
     async def test_evaluate_metric_fields_are_floats(self, evaluator: Evaluator) -> None:
         result = await evaluator.evaluate(

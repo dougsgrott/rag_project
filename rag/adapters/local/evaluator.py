@@ -7,9 +7,10 @@ __all__ = ["NoOpEvaluator"]
 class NoOpEvaluator(Evaluator):
     """Passthrough: returns a zeroed `EvaluationResult`.
 
-    Used in stacks where evaluation is not configured. `context_recall` is
-    `None` to honour the contract that recall is set only when a reference
-    answer is supplied — which the NoOp ignores.
+    Used in stacks where evaluation is not configured. `context_recall` and
+    `answer_correctness` are `None` to honour the contract that
+    reference-dependent metrics are set only when a reference answer is
+    supplied — which the NoOp ignores.
     """
 
     async def evaluate(
@@ -24,4 +25,5 @@ class NoOpEvaluator(Evaluator):
             answer_relevancy=0.0,
             context_precision=0.0,
             context_recall=None,
+            answer_correctness=None,
         )

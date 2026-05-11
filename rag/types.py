@@ -57,3 +57,4 @@ class EvaluationResult:
     answer_relevancy: float
     context_precision: float
     context_recall: float | None = None
+    answer_correctness: float | None = None
