@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_chat_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
+    openai_embedding_dim: int = 1536  # text-embedding-3-small/ada-002 default; override for other models
 
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-4-6"
