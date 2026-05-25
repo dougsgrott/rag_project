@@ -36,3 +36,17 @@ class ConversationStoreConformance:
         history_b = await store.get_history("conv-b")
         assert [m.content for m in history_a] == ["a"]
         assert [m.content for m in history_b] == ["b"]
+
+    async def test_list_conversations_empty_store_returns_empty(
+        self, store: ConversationStore
+    ) -> None:
+        assert await store.list_conversations() == []
+
+    async def test_list_conversations_returns_distinct_ids(
+        self, store: ConversationStore
+    ) -> None:
+        await store.append_message("conv-a", make_message("user", "a1"))
+        await store.append_message("conv-a", make_message("assistant", "a2"))
+        await store.append_message("conv-b", make_message("user", "b1"))
+        ids = await store.list_conversations()
+        assert sorted(ids) == ["conv-a", "conv-b"]

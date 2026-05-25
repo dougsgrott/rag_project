@@ -15,3 +15,8 @@ class ConversationStore(ABC):
     @abstractmethod
     async def append_message(self, conversation_id: str, message: Message) -> None:
         ...
+
+    @abstractmethod
+    async def list_conversations(self) -> list[str]:
+        """Return all known conversation IDs, ordered by most-recent activity first."""
+        ...
