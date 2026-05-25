@@ -42,6 +42,11 @@ async def _load_history(conversation_id: str) -> list[Message]:
         return await s.conversation_store.get_history(conversation_id)
 
 
+async def _list_conversations() -> list[str]:
+    async with build_simple_stack() as s:
+        return await s.conversation_store.list_conversations()
+
+
 async def _read_prompt(domain: str) -> str | None:
     async with build_simple_stack() as s:
         try:
@@ -79,9 +84,28 @@ def _sidebar() -> tuple[str, str]:
 
     with st.sidebar:
         st.header("Session")
+
+        try:
+            existing = asyncio.run(_list_conversations())
+        except RAGError as e:
+            st.error(f"Could not list conversations: {e}")
+            existing = []
+
+        current = qp.get("conv", "demo-1")
+        options = list(dict.fromkeys([current, *existing]))
+        picked = st.selectbox(
+            "Load conversation",
+            options=options,
+            index=options.index(current),
+            help="Pick from previously-saved conversations, or type a new ID below.",
+        )
+        if picked != current:
+            qp["conv"] = picked
+            st.rerun()
+
         conversation_id = st.text_input(
             "Conversation ID",
-            value=qp.get("conv", "demo-1"),
+            value=picked,
             help="Identifier for the multi-turn conversation. "
             "Stored in the URL so a refresh restores it.",
         )
