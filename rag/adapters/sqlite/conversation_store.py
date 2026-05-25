@@ -68,6 +68,18 @@ class SQLiteConversationStore(ConversationStore):
         async with self._lock:
             await asyncio.to_thread(self._insert, conversation_id, message)
 
+    async def list_conversations(self) -> list[str]:
+        async with self._lock:
+            return await asyncio.to_thread(self._list)
+
+    def _list(self) -> list[str]:
+        conn = self._require_conn()
+        cur = conn.execute(
+            "SELECT conversation_id FROM messages "
+            "GROUP BY conversation_id ORDER BY MAX(created_at) DESC"
+        )
+        return [row[0] for row in cur.fetchall()]
+
     def _fetch(self, conversation_id: str) -> list[tuple[str, str]]:
         conn = self._require_conn()
         cur = conn.execute(

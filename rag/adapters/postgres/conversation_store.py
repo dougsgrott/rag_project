@@ -103,6 +103,16 @@ class PostgresConversationStore(ConversationStore):
                         (conversation_id, next_pos, message.role, message.content),
                     )
 
+    async def list_conversations(self) -> list[str]:
+        async with self._require_pool().connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT conversation_id FROM {self._table} "
+                    "GROUP BY conversation_id ORDER BY MAX(created_at) DESC"
+                )
+                rows = await cur.fetchall()
+        return [row[0] for row in rows]
+
     def _require_pool(self) -> AsyncConnectionPool:
         if self._pool is None:
             raise RuntimeError(
