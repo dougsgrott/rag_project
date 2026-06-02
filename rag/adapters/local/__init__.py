@@ -1,4 +1,5 @@
 from rag.adapters.local.chunker import FixedSizeChunker
+from rag.adapters.local.chunker_structure_aware import StructureAwareChunker
 from rag.adapters.local.context_enricher import NoOpContextEnricher
 from rag.adapters.local.document_loader import LocalFileSystemLoader
 from rag.adapters.local.evaluator import NoOpEvaluator
@@ -12,4 +13,5 @@ __all__ = [
     "NoOpContextEnricher",
     "NoOpEvaluator",
     "NoOpReranker",
+    "StructureAwareChunker",
 ]

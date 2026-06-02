@@ -53,6 +53,10 @@ class _StubConversationStore(ConversationStore):
         self._r.calls.append(("append_message", conversation_id, message))
         self._history.setdefault(conversation_id, []).append(message)
 
+    async def list_conversations(self) -> list[str]:
+        self._r.calls.append(("list_conversations",))
+        return list(self._history.keys())
+
 
 class _StubRewriter(QueryRewriter):
     def __init__(self, recorder: _Recorder, prefix: str = "rewritten:") -> None:
