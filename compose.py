@@ -10,7 +10,7 @@ CLI:
     python compose.py set-prompt <domain> <prompt> [--author <name>]
     python compose.py ingest <path>
     python compose.py query <conversation_id> <query> [--domain <name>]
-    python compose.py evaluate <test_set.json> [--domain <name>]
+    python compose.py evaluate <test_set.json> [--domain <name>] [--ragas]
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from rag.adapters.local.query_rewriter import IdentityQueryRewriter
 from rag.adapters.local.reranker import NoOpReranker
 from rag.adapters.openai.embedder import OpenAIEmbedder
 from rag.adapters.openai.generator import OpenAIGenerator
+from rag.adapters.ragas.evaluator import RagasEvaluator
 from rag.adapters.sqlite.conversation_store import SQLiteConversationStore
 from rag.adapters.sqlite.prompt_store import SQLitePromptStore
 from rag.errors import ConfigurationError, RAGError
@@ -204,9 +205,25 @@ async def _run_evaluate(
     search_top_k: int,
     final_top_k: int,
     per_case: bool,
+    use_ragas: bool = False,
 ) -> None:
     cases = _load_eval_cases(cases_path)
-    async with build_simple_stack() as s:
+    async with build_simple_stack() as s, AsyncExitStack() as extra:
+        # The simple stack ships the NoOpEvaluator (zeros). `--ragas` swaps in
+        # the RAGAS-backed evaluator so the report carries real quality metrics
+        # without changing the rest of the stack (see issue #012a).
+        evaluator = s.evaluator
+        if use_ragas:
+            settings = Settings()
+            if not settings.openai_api_key:
+                raise ConfigurationError("OPENAI_API_KEY is required for --ragas")
+            evaluator = await extra.enter_async_context(
+                RagasEvaluator(
+                    api_key=settings.openai_api_key,
+                    llm_model=settings.openai_chat_model,
+                    embedding_model=settings.openai_embedding_model,
+                )
+            )
         report = await evaluate_test_set(
             prompt_store=s.prompt_store,
             conversation_store=s.conversation_store,
@@ -214,7 +231,7 @@ async def _run_evaluate(
             vector_store=s.vector_store,
             reranker=s.reranker,
             generator=s.generator,
-            evaluator=s.evaluator,
+            evaluator=evaluator,
             domain=domain,
             cases=cases,
             search_top_k=search_top_k,
@@ -267,6 +284,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--search-top-k", type=int, default=150)
     p_eval.add_argument("--final-top-k", type=int, default=5)
     p_eval.add_argument("--per-case", action="store_true", help="Also print each case's result")
+    p_eval.add_argument(
+        "--ragas",
+        action="store_true",
+        help="Score with RagasEvaluator instead of the NoOp (requires the 'ragas' group)",
+    )
 
     return parser
 
@@ -296,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
                     search_top_k=args.search_top_k,
                     final_top_k=args.final_top_k,
                     per_case=args.per_case,
+                    use_ragas=args.ragas,
                 )
             )
     except RAGError as e:

@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [
     "pypdf>=6.11.0",
+    "ragas>=0.4.3",
 ]
 
 [build-system]
@@ -44,6 +45,7 @@ cohere = [
 ragas = [
     "ragas>=0.2",
     "datasets>=2.18",
+    "langchain-openai>=0.1",
 ]
 ui = [
     "streamlit>=1.35",
