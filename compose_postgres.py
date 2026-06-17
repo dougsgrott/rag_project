@@ -18,7 +18,7 @@ CLI:
     python compose_postgres.py set-prompt <domain> <prompt> [--author <name>]
     python compose_postgres.py ingest <path>
     python compose_postgres.py query <conversation_id> <query> [--domain <name>]
-    python compose_postgres.py evaluate <test_set.json> [--domain <name>]
+    python compose_postgres.py evaluate <test_set.json> [--domain <name>] [--ragas]
 """
 
 from __future__ import annotations
@@ -152,6 +152,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--search-top-k", type=int, default=150)
     p_eval.add_argument("--final-top-k", type=int, default=5)
     p_eval.add_argument("--per-case", action="store_true")
+    p_eval.add_argument(
+        "--ragas",
+        action="store_true",
+        help="Score with RagasEvaluator instead of the NoOp (requires the 'ragas' group)",
+    )
 
     return parser
 
@@ -183,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                     search_top_k=args.search_top_k,
                     final_top_k=args.final_top_k,
                     per_case=args.per_case,
+                    use_ragas=args.ragas,
                 )
             )
     except RAGError as e:
