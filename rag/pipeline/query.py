@@ -38,8 +38,13 @@ async def execute_query(
     query: str,
     search_top_k: int = 150,
     final_top_k: int = 5,
-) -> tuple[Message, list[SearchResult]]:
-    """Run the query pipeline; return the generated answer and the context used.
+) -> tuple[Message, list[SearchResult], list[SearchResult]]:
+    """Run the query pipeline; return the answer, the wide candidate set, and
+    the reranked context used.
+
+    The pre-rerank `candidates` are returned alongside the final `context` so
+    the evaluation path can score the retriever and the reranker as separate IR
+    stages; the live path ignores them.
 
     Does *not* persist the turn — callers decide whether to append to the
     conversation store (the production path) or discard it (the evaluation
@@ -51,7 +56,7 @@ async def execute_query(
     candidates = await vector_store.search(rewritten, top_k=search_top_k)
     context = await reranker.rerank(rewritten, candidates, top_k=final_top_k)
     answer = await generator.generate(query, context, system_prompt, history)
-    return answer, context
+    return answer, candidates, context
 
 
 async def answer_query(
@@ -68,7 +73,7 @@ async def answer_query(
     search_top_k: int = 150,
     final_top_k: int = 5,
 ) -> Message:
-    answer, _ = await execute_query(
+    answer, _candidates, _context = await execute_query(
         prompt_store=prompt_store,
         conversation_store=conversation_store,
         query_rewriter=query_rewriter,
