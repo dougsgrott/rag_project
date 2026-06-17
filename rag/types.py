@@ -15,6 +15,7 @@ __all__ = [
     "Message",
     "SearchResult",
     "EvaluationResult",
+    "RetrievalResult",
 ]
 
 
@@ -58,3 +59,19 @@ class EvaluationResult:
     context_precision: float
     context_recall: float | None = None
     answer_correctness: float | None = None
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    """Rank-aware IR metrics for one ranked retrieval result scored against
+    gold relevance labels (qrels). Produced by the `RetrievalEvaluator`. All
+    rate metrics are in [0, 1]; `k` records the cutoff the metrics were
+    computed at.
+    """
+
+    recall_at_k: float
+    precision_at_k: float
+    mrr: float
+    ndcg: float
+    hit_rate: float
+    k: int

@@ -3,6 +3,7 @@
 import pytest
 
 from rag.adapters.local.evaluator import NoOpEvaluator
+from rag.adapters.local.retrieval_evaluator import LocalRetrievalEvaluator
 from rag.pipeline.evaluate import (
     EvalCase,
     EvalRecord,
@@ -10,7 +11,7 @@ from rag.pipeline.evaluate import (
     aggregate,
     evaluate_test_set,
 )
-from rag.types import EvaluationResult, Message
+from rag.types import EvaluationResult, Message, RetrievalResult
 
 from tests.pipeline.test_query import (
     _Recorder,
@@ -148,6 +149,7 @@ def _make_stubs(rec: _Recorder, generator_answer: str = "stub-answer"):
         vector_store=_StubVectorStore(rec, make_search_results(5)),
         reranker=_StubReranker(rec),
         generator=_StubGenerator(rec, answer=generator_answer),
+        retrieval_evaluator=LocalRetrievalEvaluator(),
     )
 
 
@@ -260,3 +262,81 @@ async def test_evaluate_empty_test_set_returns_empty_report() -> None:
     )
     assert report.records == []
     assert rec.calls == []  # nothing ran
+
+
+# --- retrieval metrics -----------------------------------------------------
+
+
+def _retrieval_record(retrieval=None, rerank=None) -> EvalRecord:
+    return EvalRecord(
+        case=EvalCase(query="q"),
+        answer=Message("assistant", "a"),
+        context=[],
+        result=EvaluationResult(0.0, 0.0, 0.0, None, None),
+        retrieval=retrieval,
+        rerank=rerank,
+    )
+
+
+def _ret(recall: float, k: int = 10) -> RetrievalResult:
+    return RetrievalResult(
+        recall_at_k=recall, precision_at_k=recall, mrr=recall, ndcg=recall,
+        hit_rate=1.0, k=k,
+    )
+
+
+def test_aggregate_retrieval_means_over_qrel_subset() -> None:
+    # Two cases carry qrels (retrieval scored), one does not (None).
+    records = [
+        _retrieval_record(retrieval=_ret(0.8), rerank=_ret(1.0, k=5)),
+        _retrieval_record(retrieval=None, rerank=None),
+        _retrieval_record(retrieval=_ret(0.4), rerank=_ret(0.6, k=5)),
+    ]
+    report = aggregate(records)
+    assert report.mean_retrieval is not None
+    assert report.mean_retrieval.recall_at_k == pytest.approx(0.6)  # mean(0.8, 0.4)
+    assert report.mean_retrieval.k == 10
+    assert report.mean_rerank is not None
+    assert report.mean_rerank.recall_at_k == pytest.approx(0.8)  # mean(1.0, 0.6)
+    assert report.mean_rerank.k == 5
+
+
+def test_aggregate_no_qrels_yields_none_retrieval_means() -> None:
+    report = aggregate([_retrieval_record(), _retrieval_record()])
+    assert report.mean_retrieval is None
+    assert report.mean_rerank is None
+
+
+def test_report_str_shows_dash_for_missing_retrieval() -> None:
+    report = aggregate([_retrieval_record()])
+    text = str(report)
+    assert "Retrieval (search)" in text
+    assert "Retrieval (rerank)" in text
+    assert "no qrels in test set" in text
+
+
+async def test_evaluate_scores_retrieval_only_for_cases_with_qrels() -> None:
+    rec = _Recorder()
+    # Stub vector store returns chunks from source "doc.txt"; label it relevant.
+    cases = [
+        EvalCase(query="q1", relevant_sources={"doc.txt"}),
+        EvalCase(query="q2"),  # no qrels
+    ]
+    report = await evaluate_test_set(
+        **_make_stubs(rec),
+        evaluator=NoOpEvaluator(),
+        domain="default",
+        cases=cases,
+        search_top_k=5,
+        final_top_k=2,
+        retrieval_k=5,
+    )
+    q1, q2 = report.records
+    assert q1.retrieval is not None and q1.rerank is not None
+    assert q1.retrieval.hit_rate == 1.0
+    assert q1.retrieval.recall_at_k == pytest.approx(1.0)
+    assert q1.rerank.k == 2
+    assert q2.retrieval is None and q2.rerank is None
+    # Aggregate means come only from q1.
+    assert report.mean_retrieval is not None
+    assert report.mean_retrieval.recall_at_k == pytest.approx(1.0)

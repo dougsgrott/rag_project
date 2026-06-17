@@ -36,6 +36,7 @@ from rag.adapters.local.document_loader import LocalFileSystemLoader
 from rag.adapters.local.evaluator import NoOpEvaluator
 from rag.adapters.local.query_rewriter import IdentityQueryRewriter
 from rag.adapters.local.reranker import NoOpReranker
+from rag.adapters.local.retrieval_evaluator import LocalRetrievalEvaluator
 from rag.adapters.openai.embedder import OpenAIEmbedder
 from rag.adapters.openai.generator import OpenAIGenerator
 from rag.adapters.pgvector.vector_store import PgVectorStore
@@ -103,6 +104,7 @@ async def build_postgres_stack(
             conversation_store=conversation_store,
             prompt_store=prompt_store,
             evaluator=NoOpEvaluator(),
+            retrieval_evaluator=LocalRetrievalEvaluator(),
         )
 
 
@@ -151,6 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--domain", default="default")
     p_eval.add_argument("--search-top-k", type=int, default=150)
     p_eval.add_argument("--final-top-k", type=int, default=5)
+    p_eval.add_argument("--retrieval-k", type=int, default=10)
     p_eval.add_argument("--per-case", action="store_true")
     p_eval.add_argument(
         "--ragas",
@@ -189,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                     final_top_k=args.final_top_k,
                     per_case=args.per_case,
                     use_ragas=args.ragas,
+                    retrieval_k=args.retrieval_k,
                 )
             )
     except RAGError as e:

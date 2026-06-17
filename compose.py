@@ -29,6 +29,7 @@ from rag.adapters.local.document_loader import LocalFileSystemLoader
 from rag.adapters.local.evaluator import NoOpEvaluator
 from rag.adapters.local.query_rewriter import IdentityQueryRewriter
 from rag.adapters.local.reranker import NoOpReranker
+from rag.adapters.local.retrieval_evaluator import LocalRetrievalEvaluator
 from rag.adapters.openai.embedder import OpenAIEmbedder
 from rag.adapters.openai.generator import OpenAIGenerator
 from rag.adapters.ragas.evaluator import RagasEvaluator
@@ -49,7 +50,9 @@ from rag.stages.generator import Generator
 from rag.stages.prompt_store import PromptStore
 from rag.stages.query_rewriter import QueryRewriter
 from rag.stages.reranker import Reranker
+from rag.stages.retrieval_evaluator import RetrievalEvaluator
 from rag.stages.vector_store import VectorStore
+from rag.types import RetrievalResult
 
 
 @dataclass
@@ -65,6 +68,7 @@ class SimpleStack:
     conversation_store: ConversationStore
     prompt_store: PromptStore
     evaluator: Evaluator
+    retrieval_evaluator: RetrievalEvaluator
 
 
 @asynccontextmanager
@@ -121,6 +125,10 @@ async def build_simple_stack(
             conversation_store=conversation_store,
             prompt_store=prompt_store,
             evaluator=NoOpEvaluator(),
+            # LocalRetrievalEvaluator is pure-Python and free, so unlike the
+            # LLM-judge Evaluator (gated behind --ragas) it is the default; it
+            # only scores cases that carry qrels.
+            retrieval_evaluator=LocalRetrievalEvaluator(),
         )
 
 
@@ -171,12 +179,18 @@ async def _run_set_prompt(domain: str, prompt: str, author: str) -> None:
 def _load_eval_cases(path: str) -> list[EvalCase]:
     """Load a test set from JSON.
 
-    Format: a list of objects with `query` (required) and optional
-    `reference` (string or null). Example:
+    Format: a list of objects with `query` (required) and these optionals:
+    `reference` (string or null — the gold answer, unlocks Context Recall and
+    Answer Correctness), `relevant_sources` (list of document_source strings)
+    and `relevant_chunks` (list of "<document_source>::<position>" chunk-ID
+    strings). The latter two are the gold relevance labels (qrels) that unlock
+    the retrieval metrics. Example:
 
         [
-          {"query": "What is X?", "reference": "X is ..."},
-          {"query": "Tell me about Y"}
+          {"query": "What is X?", "reference": "X is ...",
+           "relevant_sources": ["x.md"]},
+          {"query": "Tell me about Y",
+           "relevant_chunks": ["y.md::3", "y.md::4"]}
         ]
     """
     import json
@@ -188,13 +202,31 @@ def _load_eval_cases(path: str) -> list[EvalCase]:
         raise ConfigurationError(
             f"{path}: expected a JSON list of cases, got {type(raw).__name__}"
         )
+
+    def _str_set(item: dict[str, object], key: str, i: int) -> set[str] | None:
+        value = item.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ConfigurationError(
+                f"{path}[{i}]: `{key}` must be a list of strings"
+            )
+        return set(value)
+
     cases: list[EvalCase] = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict) or "query" not in item:
             raise ConfigurationError(
                 f"{path}[{i}]: each case must be an object with a `query` field"
             )
-        cases.append(EvalCase(query=item["query"], reference=item.get("reference")))
+        cases.append(
+            EvalCase(
+                query=item["query"],
+                reference=item.get("reference"),
+                relevant_sources=_str_set(item, "relevant_sources", i),
+                relevant_chunks=_str_set(item, "relevant_chunks", i),
+            )
+        )
     return cases
 
 
@@ -206,6 +238,7 @@ async def _run_evaluate(
     final_top_k: int,
     per_case: bool,
     use_ragas: bool = False,
+    retrieval_k: int = 10,
 ) -> None:
     cases = _load_eval_cases(cases_path)
     async with build_simple_stack() as s, AsyncExitStack() as extra:
@@ -232,10 +265,12 @@ async def _run_evaluate(
             reranker=s.reranker,
             generator=s.generator,
             evaluator=evaluator,
+            retrieval_evaluator=s.retrieval_evaluator,
             domain=domain,
             cases=cases,
             search_top_k=search_top_k,
             final_top_k=final_top_k,
+            retrieval_k=retrieval_k,
         )
     if per_case:
         for i, record in enumerate(report.records):
@@ -245,13 +280,24 @@ async def _run_evaluate(
                 return f"{v:.3f}" if v is not None else "—"
 
             print(
-                f"  metrics: "
+                f"  gen:     "
                 f"F={record.result.faithfulness:.3f} "
                 f"AR={record.result.answer_relevancy:.3f} "
                 f"CP={record.result.context_precision:.3f} "
                 f"CR={_fmt(record.result.context_recall)} "
                 f"AC={_fmt(record.result.answer_correctness)}"
             )
+
+            def _ret(r: RetrievalResult | None) -> str:
+                if r is None:
+                    return "— (no qrels)"
+                return (
+                    f"R@{r.k}={r.recall_at_k:.3f} P@{r.k}={r.precision_at_k:.3f} "
+                    f"MRR={r.mrr:.3f} nDCG={r.ndcg:.3f} Hit={r.hit_rate:.3f}"
+                )
+
+            print(f"  search:  {_ret(record.retrieval)}")
+            print(f"  rerank:  {_ret(record.rerank)}")
             print()
     print(report)
 
@@ -283,6 +329,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--domain", default="default")
     p_eval.add_argument("--search-top-k", type=int, default=150)
     p_eval.add_argument("--final-top-k", type=int, default=5)
+    p_eval.add_argument(
+        "--retrieval-k",
+        type=int,
+        default=10,
+        help="Cutoff k for retrieval metrics on the wide candidate set (qrels only)",
+    )
     p_eval.add_argument("--per-case", action="store_true", help="Also print each case's result")
     p_eval.add_argument(
         "--ragas",
@@ -319,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                     final_top_k=args.final_top_k,
                     per_case=args.per_case,
                     use_ragas=args.ragas,
+                    retrieval_k=args.retrieval_k,
                 )
             )
     except RAGError as e:
