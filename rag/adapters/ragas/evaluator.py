@@ -18,6 +18,7 @@ backend — do not depend on the `ragas` group being installed. Install it with
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 from types import TracebackType
 from typing import Any
@@ -63,6 +64,13 @@ class RagasEvaluator(Evaluator):
         self._api_key = api_key
         self._llm_model = llm_model
         self._embedding_model = embedding_model
+        # RAGAS LLM/embeddings wrappers, built once on first use and reused
+        # across calls. The raw langchain objects are kept so their OpenAI
+        # clients can be closed on exit.
+        self._llm: Any = None
+        self._embeddings: Any = None
+        self._chat: Any = None
+        self._raw_embeddings: Any = None
 
     async def __aenter__(self) -> "RagasEvaluator":
         return self
@@ -73,7 +81,7 @@ class RagasEvaluator(Evaluator):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        return None
+        await self._aclose_backends()
 
     async def evaluate(
         self,
@@ -126,11 +134,7 @@ class RagasEvaluator(Evaluator):
         """
         try:
             from datasets import Dataset  # type: ignore[import-untyped]
-            from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-            from pydantic import SecretStr
             from ragas import evaluate as ragas_evaluate
-            from ragas.embeddings import LangchainEmbeddingsWrapper
-            from ragas.llms import LangchainLLMWrapper
             from ragas.metrics import (
                 answer_correctness,
                 answer_relevancy,
@@ -143,6 +147,8 @@ class RagasEvaluator(Evaluator):
                 "RagasEvaluator requires the 'ragas' dependency group "
                 "(run: uv sync --group ragas). Underlying import error: " + str(e)
             ) from e
+
+        llm, embeddings = self._ensure_backends()
 
         by_name = {
             _FAITHFULNESS: faithfulness,
@@ -162,14 +168,6 @@ class RagasEvaluator(Evaluator):
             data["ground_truth"] = [reference]
         dataset = Dataset.from_dict(data)
 
-        api_key = SecretStr(self._api_key)
-        llm = LangchainLLMWrapper(
-            ChatOpenAI(model=self._llm_model, api_key=api_key, temperature=0.0)
-        )
-        embeddings = LangchainEmbeddingsWrapper(
-            OpenAIEmbeddings(model=self._embedding_model, api_key=api_key)
-        )
-
         try:
             result: Any = ragas_evaluate(
                 dataset=dataset, metrics=metrics, llm=llm, embeddings=embeddings
@@ -184,6 +182,71 @@ class RagasEvaluator(Evaluator):
             value = row[column] if column in row else row[name]
             scores[name] = float(value)
         return scores
+
+    def _ensure_backends(self) -> tuple[Any, Any]:
+        """Build and cache the RAGAS LLM + embeddings wrappers.
+
+        Built once and reused across calls: constructing a fresh
+        ChatOpenAI/OpenAIEmbeddings per `evaluate()` spins up a new pair of
+        OpenAI HTTP clients each time, wasting connections and leaving clients
+        to be finalised after the event loop closes (the "Event loop is closed"
+        noise). The raw langchain objects are retained for teardown.
+        """
+        if self._llm is not None and self._embeddings is not None:
+            return self._llm, self._embeddings
+        try:
+            from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+            from pydantic import SecretStr
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+            from ragas.llms import LangchainLLMWrapper
+        except ImportError as e:  # pragma: no cover - exercised only without the group
+            raise ConfigurationError(
+                "RagasEvaluator requires the 'ragas' dependency group "
+                "(run: uv sync --group ragas). Underlying import error: " + str(e)
+            ) from e
+
+        api_key = SecretStr(self._api_key)
+        self._chat = ChatOpenAI(
+            model=self._llm_model, api_key=api_key, temperature=0.0
+        )
+        self._raw_embeddings = OpenAIEmbeddings(
+            model=self._embedding_model, api_key=api_key
+        )
+        self._llm = LangchainLLMWrapper(self._chat)
+        self._embeddings = LangchainEmbeddingsWrapper(self._raw_embeddings)
+        return self._llm, self._embeddings
+
+    async def _aclose_backends(self) -> None:
+        """Close the OpenAI HTTP clients the langchain backends opened.
+
+        Runs from `__aexit__`, while the event loop is still open, so the
+        async clients are torn down cleanly instead of being finalised against
+        a closed loop. Best-effort and defensive across langchain/openai
+        versions; a no-op when the backends were never built (e.g. mocked).
+        """
+        # pragma: no cover - real clients only exist on the live RAGAS path.
+        clients: list[Any] = []
+        for obj in (self._chat, self._raw_embeddings):
+            if obj is None:
+                continue
+            clients.append(getattr(obj, "root_async_client", None))
+            clients.append(getattr(obj, "root_client", None))
+            for attr in ("async_client", "client"):
+                resource = getattr(obj, attr, None)
+                clients.append(getattr(resource, "_client", None))
+
+        for client in clients:
+            closer = getattr(client, "close", None)
+            if closer is None:
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                pass
+
+        self._llm = self._embeddings = self._chat = self._raw_embeddings = None
 
 
 def _score(scores: dict[str, float], name: str) -> float:

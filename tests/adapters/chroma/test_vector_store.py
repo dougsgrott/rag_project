@@ -64,6 +64,19 @@ class TestChromaVectorStoreUnit:
         assert isinstance(results[0], SearchResult)
         assert isinstance(results[0].score, float)
 
+    async def test_index_splits_large_write_into_batches(self) -> None:
+        # Force a tiny max batch so a handful of chunks exercises the batching
+        # loop without indexing thousands of rows.
+        async with ChromaVectorStore(
+            embedder=StubEmbedder(),
+            collection_name="unit-batch",
+        ) as store:
+            store._max_batch_size = 2
+            await store.index(make_chunks(5, source="b.txt"))
+            results = await store.search("alpha", top_k=10)
+        assert len(results) == 5
+        assert {r.chunk.position for r in results} == {0, 1, 2, 3, 4}
+
     async def test_use_outside_context_raises(self) -> None:
         store = ChromaVectorStore(embedder=StubEmbedder(), collection_name="unit")
         with pytest.raises(RuntimeError):

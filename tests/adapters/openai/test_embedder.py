@@ -11,7 +11,7 @@ from rag.errors import (
     RateLimitError,
 )
 
-from tests.stages._helpers import make_chunks
+from tests.stages._helpers import make_chunk, make_chunks
 from tests.stages.embedder_conformance import EmbedderConformance
 
 
@@ -80,6 +80,27 @@ class TestOpenAIEmbedderUnit:
         call = client.embeddings.create.await_args
         assert call.kwargs["input"] == [c.content for c in chunks]
         assert call.kwargs["model"] == "text-embedding-3-small"
+
+    async def test_embed_small_input_is_single_batch(self) -> None:
+        client = _build_fake_client()
+        chunks = make_chunks(3)
+        with _patch_async_openai(client):
+            async with OpenAIEmbedder(api_key="sk-test") as e:
+                await e.embed(chunks)
+        assert client.embeddings.create.await_count == 1
+
+    async def test_embed_splits_into_batches_over_token_budget(self) -> None:
+        # Each chunk ~75k estimated tokens (300k chars / 4); the 200k-token
+        # budget admits at most two per request, so 5 chunks -> 3 requests.
+        client = _build_fake_client()
+        chunks = [make_chunk(position=i, content="x" * 300_000) for i in range(5)]
+        with _patch_async_openai(client):
+            async with OpenAIEmbedder(api_key="sk-test") as e:
+                result = await e.embed(chunks)
+        assert len(result) == 5
+        assert client.embeddings.create.await_count == 3
+        # Order is preserved across batches.
+        assert [r.chunk.position for r in result] == [0, 1, 2, 3, 4]
 
     async def test_embed_empty_skips_api_call(self) -> None:
         client = _build_fake_client()
