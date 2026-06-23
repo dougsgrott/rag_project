@@ -54,6 +54,15 @@ Thumbs.db
 
 docs/
 ignore/
+data/
+datasets/
+reports/
 .claude/
 BUILD_PLAN.md
 CONTEXT.md
+
+compiler.py
+teste.ipynb
+RAG_DATASET_EVAL.md
+compiled_code.txt
+rag_pipeline_playground.html

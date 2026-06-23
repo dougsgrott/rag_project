@@ -6,7 +6,9 @@ requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [
     "anthropic>=0.100.0",
+    "beir>=2.2.0",
     "ipykernel>=7.3.0",
+    "langchain-openai>=1.2.1",
     "pypdf>=6.11.0",
     "python-dotenv>=1.2.2",
     "ragas>=0.4.3",
