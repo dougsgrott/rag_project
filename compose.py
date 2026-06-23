@@ -11,6 +11,7 @@ CLI:
     python compose.py ingest <path>
     python compose.py query <conversation_id> <query> [--domain <name>]
     python compose.py evaluate <test_set.json> [--domain <name>] [--ragas]
+    python compose.py evaluate-multihop [<dataset_dir>] [--limit N] [--ragas]
 """
 
 from __future__ import annotations
@@ -20,13 +21,17 @@ import asyncio
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import AsyncIterator, Sequence
 
 from rag.adapters.chroma.vector_store import ChromaVectorStore
 from rag.adapters.local.chunker import FixedSizeChunker
 from rag.adapters.local.context_enricher import NoOpContextEnricher
 from rag.adapters.local.document_loader import LocalFileSystemLoader
 from rag.adapters.local.evaluator import NoOpEvaluator
+from rag.adapters.local.multihop_rag import (
+    MultiHopRagDocumentLoader,
+    load_multihop_cases,
+)
 from rag.adapters.local.query_rewriter import IdentityQueryRewriter
 from rag.adapters.local.reranker import NoOpReranker
 from rag.adapters.local.retrieval_evaluator import LocalRetrievalEvaluator
@@ -36,7 +41,13 @@ from rag.adapters.ragas.evaluator import RagasEvaluator
 from rag.adapters.sqlite.conversation_store import SQLiteConversationStore
 from rag.adapters.sqlite.prompt_store import SQLitePromptStore
 from rag.errors import ConfigurationError, RAGError
-from rag.pipeline.evaluate import EvalCase, evaluate_test_set
+from rag.pipeline.evaluate import (
+    EvalCase,
+    EvalRecord,
+    EvaluationReport,
+    aggregate,
+    evaluate_test_set,
+)
 from rag.pipeline.ingest import ingest_documents
 from rag.pipeline.query import answer_query
 from rag.settings import Settings
@@ -76,12 +87,18 @@ async def build_simple_stack(
     settings: Settings | None = None,
     *,
     collection_name: str = "rag_documents",
+    persist_dir: str | None = None,
 ) -> AsyncIterator[SimpleStack]:
     """Build and yield the fully-wired simple stack.
 
     Resource-owning adapters are entered through one `AsyncExitStack` so a
     single `async with` releases everything in reverse order on exit
     (ADR-0007). NoOp/Identity adapters are stateless and constructed inline.
+
+    `persist_dir` overrides the Chroma store location for this stack; when
+    None the configured `settings.chroma_persist_dir` is used. This lets a
+    caller isolate a dataset's index in its own file rather than sharing the
+    default store.
     """
     settings = settings or Settings()
     if not settings.openai_api_key:
@@ -98,7 +115,7 @@ async def build_simple_stack(
             ChromaVectorStore(
                 embedder=embedder,
                 collection_name=collection_name,
-                persist_dir=settings.chroma_persist_dir,
+                persist_dir=persist_dir or settings.chroma_persist_dir,
             )
         )
         generator = await stack.enter_async_context(
@@ -230,6 +247,82 @@ def _load_eval_cases(path: str) -> list[EvalCase]:
     return cases
 
 
+async def _build_evaluator(
+    extra: AsyncExitStack, *, default: Evaluator, use_ragas: bool
+) -> Evaluator:
+    """Return the `default` evaluator, or a RagasEvaluator when `--ragas` is set.
+
+    The simple stack ships the NoOpEvaluator (zeros); `--ragas` swaps in the
+    RAGAS-backed evaluator so the report carries real quality metrics without
+    changing the rest of the stack (see issue #012a). The Ragas adapter is
+    entered through `extra` so it is released with the rest of the stack.
+    """
+    if not use_ragas:
+        return default
+    settings = Settings()
+    if not settings.openai_api_key:
+        raise ConfigurationError("OPENAI_API_KEY is required for --ragas")
+    return await extra.enter_async_context(
+        RagasEvaluator(
+            api_key=settings.openai_api_key,
+            llm_model=settings.openai_chat_model,
+            embedding_model=settings.openai_embedding_model,
+        )
+    )
+
+
+def _print_per_case(records: Sequence[EvalRecord]) -> None:
+    for i, record in enumerate(records):
+        print(f"--- case {i + 1}: {record.case.query!r}")
+        print(f"  answer:  {record.answer.content[:200]}")
+
+        def _fmt(v: float | None) -> str:
+            return f"{v:.3f}" if v is not None else "—"
+
+        print(
+            f"  gen:     "
+            f"F={record.result.faithfulness:.3f} "
+            f"AR={record.result.answer_relevancy:.3f} "
+            f"CP={record.result.context_precision:.3f} "
+            f"CR={_fmt(record.result.context_recall)} "
+            f"AC={_fmt(record.result.answer_correctness)}"
+        )
+
+        def _ret(r: RetrievalResult | None) -> str:
+            if r is None:
+                return "— (no qrels)"
+            return (
+                f"R@{r.k}={r.recall_at_k:.3f} P@{r.k}={r.precision_at_k:.3f} "
+                f"MRR={r.mrr:.3f} nDCG={r.ndcg:.3f} Hit={r.hit_rate:.3f}"
+            )
+
+        print(f"  search:  {_ret(record.retrieval)}")
+        print(f"  rerank:  {_ret(record.rerank)}")
+        print()
+
+
+def _print_by_question_type(
+    report: EvaluationReport, question_types: dict[str, str]
+) -> None:
+    """Re-aggregate the report per `question_type` and print each slice.
+
+    The categories (inference / comparison / temporal / null) fail in different
+    ways — null_query cases carry no qrels, so their retrieval lines read
+    "no qrels" — and one averaged number would hide that. Grouping by the
+    sidecar keeps the segments visible.
+    """
+    by_type: dict[str, list[EvalRecord]] = {}
+    for record in report.records:
+        question_type = question_types.get(record.case.query, "(unknown)")
+        by_type.setdefault(question_type, []).append(record)
+
+    print("\n=== by question_type ===")
+    for question_type in sorted(by_type):
+        records = by_type[question_type]
+        print(f"\n[{question_type}] {len(records)} cases")
+        print(aggregate(records))
+
+
 async def _run_evaluate(
     cases_path: str,
     *,
@@ -239,24 +332,14 @@ async def _run_evaluate(
     per_case: bool,
     use_ragas: bool = False,
     retrieval_k: int = 10,
+    output_file: str | None = None,
 ) -> None:
     cases = _load_eval_cases(cases_path)
+    settings = Settings()
     async with build_simple_stack() as s, AsyncExitStack() as extra:
-        # The simple stack ships the NoOpEvaluator (zeros). `--ragas` swaps in
-        # the RAGAS-backed evaluator so the report carries real quality metrics
-        # without changing the rest of the stack (see issue #012a).
-        evaluator = s.evaluator
-        if use_ragas:
-            settings = Settings()
-            if not settings.openai_api_key:
-                raise ConfigurationError("OPENAI_API_KEY is required for --ragas")
-            evaluator = await extra.enter_async_context(
-                RagasEvaluator(
-                    api_key=settings.openai_api_key,
-                    llm_model=settings.openai_chat_model,
-                    embedding_model=settings.openai_embedding_model,
-                )
-            )
+        evaluator = await _build_evaluator(
+            extra, default=s.evaluator, use_ragas=use_ragas
+        )
         report = await evaluate_test_set(
             prompt_store=s.prompt_store,
             conversation_store=s.conversation_store,
@@ -273,33 +356,121 @@ async def _run_evaluate(
             retrieval_k=retrieval_k,
         )
     if per_case:
-        for i, record in enumerate(report.records):
-            print(f"--- case {i + 1}: {record.case.query!r}")
-            print(f"  answer:  {record.answer.content[:200]}")
-            def _fmt(v: float | None) -> str:
-                return f"{v:.3f}" if v is not None else "—"
-
-            print(
-                f"  gen:     "
-                f"F={record.result.faithfulness:.3f} "
-                f"AR={record.result.answer_relevancy:.3f} "
-                f"CP={record.result.context_precision:.3f} "
-                f"CR={_fmt(record.result.context_recall)} "
-                f"AC={_fmt(record.result.answer_correctness)}"
-            )
-
-            def _ret(r: RetrievalResult | None) -> str:
-                if r is None:
-                    return "— (no qrels)"
-                return (
-                    f"R@{r.k}={r.recall_at_k:.3f} P@{r.k}={r.precision_at_k:.3f} "
-                    f"MRR={r.mrr:.3f} nDCG={r.ndcg:.3f} Hit={r.hit_rate:.3f}"
-                )
-
-            print(f"  search:  {_ret(record.retrieval)}")
-            print(f"  rerank:  {_ret(record.rerank)}")
-            print()
+        _print_per_case(report.records)
     print(report)
+
+    # Optional report tracking hook for regular test sets
+    if output_file:
+        from rag.pipeline.report import save_markdown_report
+        meta_config = {
+            "domain": domain,
+            "chat_model": settings.openai_chat_model,
+            "embedding_model": settings.openai_embedding_model,
+            "search_top_k": search_top_k,
+            "final_top_k": final_top_k
+        }
+        save_markdown_report(report, output_file, meta_config=meta_config)
+        print(f"Detailed evaluation metrics written safely to {output_file}")
+
+
+async def _run_evaluate_multihop(
+    dataset_dir: str,
+    *,
+    domain: str,
+    search_top_k: int,
+    final_top_k: int,
+    per_case: bool,
+    use_ragas: bool,
+    retrieval_k: int,
+    skip_index: bool,
+    limit: int | None,
+    persist_dir: str | None,
+    output_file: str | None = None,
+) -> None:
+    """Index the MultiHop-RAG corpus, run the eval set, slice by question_type.
+
+    Indexes into its own Chroma file (default ``<dataset_dir>/.chroma``, a
+    `multihop_rag` collection) so the news corpus stays isolated from the
+    default store. Indexing is idempotent-unfriendly (re-running re-embeds, and
+    upsert overwrites rather than appends), so pass `--skip-index` on repeat
+    runs once the corpus is already indexed.
+    """
+    from pathlib import Path
+    from datetime import datetime
+
+    settings = Settings()
+    loader = MultiHopRagDocumentLoader()
+    cases, question_types = load_multihop_cases(dataset_dir)
+    if limit is not None:
+        cases = cases[:limit]
+    store_dir = persist_dir or str(Path(dataset_dir) / ".chroma")
+
+    async with (
+        build_simple_stack(
+            collection_name="multihop_rag", persist_dir=store_dir
+        ) as s,
+        AsyncExitStack() as extra,
+    ):
+        if not skip_index:
+            count = await ingest_documents(
+                loader=loader,
+                chunker=s.chunker,
+                enricher=s.enricher,
+                store=s.vector_store,
+                source=dataset_dir,
+            )
+            print(f"indexed {count} chunks from {dataset_dir} into {store_dir}")
+
+        evaluator = await _build_evaluator(
+            extra, default=s.evaluator, use_ragas=use_ragas
+        )
+        report = await evaluate_test_set(
+            prompt_store=s.prompt_store,
+            conversation_store=s.conversation_store,
+            query_rewriter=s.query_rewriter,
+            vector_store=s.vector_store,
+            reranker=s.reranker,
+            generator=s.generator,
+            evaluator=evaluator,
+            retrieval_evaluator=s.retrieval_evaluator,
+            domain=domain,
+            cases=cases,
+            search_top_k=search_top_k,
+            final_top_k=final_top_k,
+            retrieval_k=retrieval_k,
+        )
+    if per_case:
+        _print_per_case(report.records)
+    print(report)
+    _print_by_question_type(report, question_types)
+
+    # Markdown report logging logic
+    if output_file:
+        from rag.pipeline.report import save_markdown_report
+        
+        # If the user leaves it as default or passes a placeholder, resolve the timestamp
+        if "{timestamp}" in output_file or output_file == "evaluation_report.md":
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # We redirect to a dedicated 'reports' directory to avoid cluttering root
+            output_path = Path("reports") / f"evaluation_report_{timestamp}.md"
+        else:
+            output_path = Path(output_file)
+
+        meta_config = {
+            "domain": domain,
+            "chat_model": settings.openai_chat_model,
+            "embedding_model": settings.openai_embedding_model,
+            "search_top_k": search_top_k,
+            "final_top_k": final_top_k
+        }
+        
+        save_markdown_report(
+            report, 
+            output_path, 
+            meta_config=meta_config, 
+            question_types=question_types
+        )
+        print(f"Detailed Markdown evaluation metrics written to: {output_path}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -341,6 +512,55 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Score with RagasEvaluator instead of the NoOp (requires the 'ragas' group)",
     )
+    p_eval.add_argument("--output", default=None, help="Path to write out the Markdown log file")
+
+    p_mh = sub.add_parser(
+        "evaluate-multihop",
+        help="Index the MultiHop-RAG corpus and evaluate, sliced by question_type",
+    )
+    p_mh.add_argument(
+        "dataset_dir",
+        nargs="?",
+        default="datasets/multihop-rag",
+        help="MultiHop-RAG dataset directory (with corpus.json + MultiHopRAG.json)",
+    )
+    p_mh.add_argument("--domain", default="default")
+    p_mh.add_argument("--search-top-k", type=int, default=150)
+    p_mh.add_argument("--final-top-k", type=int, default=5)
+    p_mh.add_argument(
+        "--retrieval-k",
+        type=int,
+        default=10,
+        help="Cutoff k for retrieval metrics on the wide candidate set (qrels only)",
+    )
+    p_mh.add_argument("--per-case", action="store_true", help="Also print each case's result")
+    p_mh.add_argument(
+        "--ragas",
+        action="store_true",
+        help="Score with RagasEvaluator instead of the NoOp (requires the 'ragas' group)",
+    )
+    p_mh.add_argument(
+        "--skip-index",
+        action="store_true",
+        help="Skip corpus indexing (use when the collection is already populated)",
+    )
+    p_mh.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Evaluate only the first N queries (cheap smoke run; full set is 2,556)",
+    )
+    p_mh.add_argument(
+        "--persist-dir",
+        default=None,
+        help="Chroma store location (default: <dataset_dir>/.chroma, isolated "
+        "from the default store)",
+    )
+    p_mh.add_argument(
+        "--output", 
+        default="evaluation_report.md", 
+        help="Path to write the Markdown file. If default, it auto-resolves to 'reports/evaluation_report_<timestamp>.md'"
+    )
 
     return parser
 
@@ -372,6 +592,23 @@ def main(argv: list[str] | None = None) -> int:
                     per_case=args.per_case,
                     use_ragas=args.ragas,
                     retrieval_k=args.retrieval_k,
+                    output_file=args.output
+                )
+            )
+        elif args.cmd == "evaluate-multihop":
+            asyncio.run(
+                _run_evaluate_multihop(
+                    args.dataset_dir,
+                    domain=args.domain,
+                    search_top_k=args.search_top_k,
+                    final_top_k=args.final_top_k,
+                    per_case=args.per_case,
+                    use_ragas=args.ragas,
+                    retrieval_k=args.retrieval_k,
+                    skip_index=args.skip_index,
+                    limit=args.limit,
+                    persist_dir=args.persist_dir,
+                    output_file=args.output
                 )
             )
     except RAGError as e:
