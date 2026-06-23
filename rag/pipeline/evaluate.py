@@ -51,6 +51,7 @@ class EvalCase:
 class EvalRecord:
     case: EvalCase
     answer: Message
+    candidates: list[SearchResult]
     context: list[SearchResult]
     result: EvaluationResult
     # Retrieval metrics for the two IR stages — None when the case has no qrels.
@@ -155,6 +156,7 @@ async def evaluate_test_set(
             EvalRecord(
                 case=case,
                 answer=answer,
+                candidates=candidates,
                 context=context,
                 result=result,
                 retrieval=retrieval,

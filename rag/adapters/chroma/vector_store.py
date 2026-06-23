@@ -12,6 +12,12 @@ from rag.types import Chunk, SearchResult
 
 __all__ = ["ChromaVectorStore"]
 
+# Chroma rejects an upsert larger than its configured max batch size (the limit
+# is reported by the client; this is the fallback when it can't be read). A
+# large corpus produces far more chunks than one upsert allows, so index() must
+# split the write into batches.
+_DEFAULT_MAX_UPSERT_BATCH = 5_000
+
 
 class ChromaVectorStore(VectorStore):
     """Chroma-backed VectorStore.
@@ -33,6 +39,7 @@ class ChromaVectorStore(VectorStore):
         self._persist_dir = persist_dir
         self._client: chromadb.api.ClientAPI | None = None
         self._collection: Any = None
+        self._max_batch_size: int = _DEFAULT_MAX_UPSERT_BATCH
 
     async def __aenter__(self) -> "ChromaVectorStore":
         self._client, self._collection = await asyncio.to_thread(self._init_client)
@@ -53,21 +60,23 @@ class ChromaVectorStore(VectorStore):
         if not chunks:
             return
         embedded = await self._embedder.embed(chunks)
-        ids = [self._chunk_id(ec.chunk) for ec in embedded]
-        documents = [ec.chunk.content for ec in embedded]
-        embeddings = [ec.vector for ec in embedded]
-        metadatas = [
-            {"document_source": ec.chunk.document_source, "position": ec.chunk.position}
-            for ec in embedded
-        ]
         collection = self._require_collection()
-        await asyncio.to_thread(
-            collection.upsert,
-            ids=ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas,
-        )
+        batch_size = max(1, self._max_batch_size)
+        for start in range(0, len(embedded), batch_size):
+            batch = embedded[start : start + batch_size]
+            await asyncio.to_thread(
+                collection.upsert,
+                ids=[self._chunk_id(ec.chunk) for ec in batch],
+                embeddings=[ec.vector for ec in batch],
+                documents=[ec.chunk.content for ec in batch],
+                metadatas=[
+                    {
+                        "document_source": ec.chunk.document_source,
+                        "position": ec.chunk.position,
+                    }
+                    for ec in batch
+                ],
+            )
 
     async def search(self, query: str, top_k: int) -> list[SearchResult]:
         if top_k <= 0:
@@ -90,6 +99,14 @@ class ChromaVectorStore(VectorStore):
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
         )
+        # Prefer the client's own reported limit; fall back to the default if
+        # this Chroma version doesn't expose it.
+        try:
+            reported = int(client.get_max_batch_size())
+            if reported > 0:
+                self._max_batch_size = reported
+        except (AttributeError, ValueError, TypeError):
+            pass
         return client, collection
 
     def _require_collection(self) -> Any:
