@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator, Sequence
 
@@ -89,6 +89,7 @@ async def build_simple_stack(
     collection_name: str = "rag_documents",
     persist_dir: str | None = None,
     use_hybrid: bool = False,
+    use_multi_query: bool = False,
 ) -> AsyncIterator[SimpleStack]:
     """Build and yield the fully-wired simple stack.
 
@@ -105,6 +106,11 @@ async def build_simple_stack(
     `HybridVectorStore` (technique A1) — dense + lexical retrieval fused with
     RRF. It is off by default so the plain Chroma path needs no `rank-bm25`; the
     BM25 dependency is imported lazily only when this is set.
+
+    `use_multi_query` wraps the retriever in a `MultiQueryRetriever` (technique
+    A2) — the stack's `Generator` expands each query into several variants whose
+    results are RRF-fused. It composes on top of `use_hybrid` (the inner store is
+    then the hybrid one).
     """
     settings = settings or Settings()
     if not settings.openai_api_key:
@@ -117,29 +123,40 @@ async def build_simple_stack(
                 model=settings.openai_embedding_model,
             )
         )
-        dense_store = ChromaVectorStore(
-            embedder=embedder,
-            collection_name=collection_name,
-            persist_dir=persist_dir or settings.chroma_persist_dir,
-        )
-        vector_store: VectorStore
-        if use_hybrid:
-            # Lazy imports: the BM25 store pulls in `rank-bm25` (the `bm25`
-            # dependency group), which the default dense-only path does not need.
-            from rag.adapters.hybrid.vector_store import HybridVectorStore
-            from rag.adapters.local.bm25_vector_store import BM25VectorStore
-
-            vector_store = await stack.enter_async_context(
-                HybridVectorStore(dense=dense_store, sparse=BM25VectorStore())
-            )
-        else:
-            vector_store = await stack.enter_async_context(dense_store)
         generator = await stack.enter_async_context(
             OpenAIGenerator(
                 api_key=settings.openai_api_key,
                 model=settings.openai_chat_model,
             )
         )
+        # Build the retrieval stack inner-to-outer: dense → (optional hybrid) →
+        # (optional multi-query). Each wrapper delegates lifecycle to the store
+        # it wraps, so only the outermost is entered here.
+        inner_store: VectorStore = ChromaVectorStore(
+            embedder=embedder,
+            collection_name=collection_name,
+            persist_dir=persist_dir or settings.chroma_persist_dir,
+        )
+        if use_hybrid:
+            # Lazy imports: the BM25 store pulls in `rank-bm25` (the `bm25`
+            # dependency group), which the default dense-only path does not need.
+            from rag.adapters.hybrid.vector_store import HybridVectorStore
+            from rag.adapters.local.bm25_vector_store import BM25VectorStore
+
+            inner_store = HybridVectorStore(
+                dense=inner_store, sparse=BM25VectorStore()
+            )
+        vector_store: VectorStore
+        if use_multi_query:
+            from rag.adapters.generic.multi_query_retriever import MultiQueryRetriever
+
+            vector_store = await stack.enter_async_context(
+                MultiQueryRetriever(inner=inner_store, generator=generator)
+            )
+        elif isinstance(inner_store, AbstractAsyncContextManager):
+            vector_store = await stack.enter_async_context(inner_store)
+        else:
+            vector_store = inner_store
         conversation_store = await stack.enter_async_context(
             SQLiteConversationStore(path=settings.sqlite_path)
         )
@@ -402,6 +419,7 @@ async def _run_evaluate_multihop(
     limit: int | None,
     persist_dir: str | None,
     use_hybrid: bool = False,
+    use_multi_query: bool = False,
     output_file: str | None = None,
 ) -> None:
     """Index the MultiHop-RAG corpus, run the eval set, slice by question_type.
@@ -416,6 +434,10 @@ async def _run_evaluate_multihop(
     is in-memory and rebuilt per run, so `--skip-index` (which exists to avoid
     re-embedding the Chroma store) cannot apply: it is ignored under `--hybrid`,
     and a full ingest runs so both stores are populated.
+
+    `use_multi_query` selects the A2 multi-query expansion retriever; it composes
+    with `use_hybrid`. It only changes query-time behaviour, so `--skip-index`
+    still applies to it.
     """
     from pathlib import Path
     from datetime import datetime
@@ -439,6 +461,7 @@ async def _run_evaluate_multihop(
             collection_name="multihop_rag",
             persist_dir=store_dir,
             use_hybrid=use_hybrid,
+            use_multi_query=use_multi_query,
         ) as s,
         AsyncExitStack() as extra,
     ):
@@ -582,6 +605,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "Forces a full re-index since the BM25 index is in-memory.",
     )
     p_mh.add_argument(
+        "--multi-query",
+        action="store_true",
+        help="Expand each query into variants (via the LLM) and RRF-fuse their "
+        "results (technique A2). Composes with --hybrid.",
+    )
+    p_mh.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -646,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
                     limit=args.limit,
                     persist_dir=args.persist_dir,
                     use_hybrid=args.hybrid,
+                    use_multi_query=args.multi_query,
                     output_file=args.output
                 )
             )
