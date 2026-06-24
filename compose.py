@@ -88,6 +88,7 @@ async def build_simple_stack(
     *,
     collection_name: str = "rag_documents",
     persist_dir: str | None = None,
+    use_hybrid: bool = False,
 ) -> AsyncIterator[SimpleStack]:
     """Build and yield the fully-wired simple stack.
 
@@ -99,6 +100,11 @@ async def build_simple_stack(
     None the configured `settings.chroma_persist_dir` is used. This lets a
     caller isolate a dataset's index in its own file rather than sharing the
     default store.
+
+    `use_hybrid` wraps the dense Chroma store and a BM25 store in a
+    `HybridVectorStore` (technique A1) — dense + lexical retrieval fused with
+    RRF. It is off by default so the plain Chroma path needs no `rank-bm25`; the
+    BM25 dependency is imported lazily only when this is set.
     """
     settings = settings or Settings()
     if not settings.openai_api_key:
@@ -111,13 +117,23 @@ async def build_simple_stack(
                 model=settings.openai_embedding_model,
             )
         )
-        vector_store = await stack.enter_async_context(
-            ChromaVectorStore(
-                embedder=embedder,
-                collection_name=collection_name,
-                persist_dir=persist_dir or settings.chroma_persist_dir,
-            )
+        dense_store = ChromaVectorStore(
+            embedder=embedder,
+            collection_name=collection_name,
+            persist_dir=persist_dir or settings.chroma_persist_dir,
         )
+        vector_store: VectorStore
+        if use_hybrid:
+            # Lazy imports: the BM25 store pulls in `rank-bm25` (the `bm25`
+            # dependency group), which the default dense-only path does not need.
+            from rag.adapters.hybrid.vector_store import HybridVectorStore
+            from rag.adapters.local.bm25_vector_store import BM25VectorStore
+
+            vector_store = await stack.enter_async_context(
+                HybridVectorStore(dense=dense_store, sparse=BM25VectorStore())
+            )
+        else:
+            vector_store = await stack.enter_async_context(dense_store)
         generator = await stack.enter_async_context(
             OpenAIGenerator(
                 api_key=settings.openai_api_key,
@@ -385,6 +401,7 @@ async def _run_evaluate_multihop(
     skip_index: bool,
     limit: int | None,
     persist_dir: str | None,
+    use_hybrid: bool = False,
     output_file: str | None = None,
 ) -> None:
     """Index the MultiHop-RAG corpus, run the eval set, slice by question_type.
@@ -394,6 +411,11 @@ async def _run_evaluate_multihop(
     default store. Indexing is idempotent-unfriendly (re-running re-embeds, and
     upsert overwrites rather than appends), so pass `--skip-index` on repeat
     runs once the corpus is already indexed.
+
+    `use_hybrid` selects the A1 hybrid (dense + BM25) retriever. The BM25 index
+    is in-memory and rebuilt per run, so `--skip-index` (which exists to avoid
+    re-embedding the Chroma store) cannot apply: it is ignored under `--hybrid`,
+    and a full ingest runs so both stores are populated.
     """
     from pathlib import Path
     from datetime import datetime
@@ -405,9 +427,18 @@ async def _run_evaluate_multihop(
         cases = cases[:limit]
     store_dir = persist_dir or str(Path(dataset_dir) / ".chroma")
 
+    if use_hybrid and skip_index:
+        print(
+            "note: --skip-index is ignored under --hybrid "
+            "(the in-memory BM25 index must be rebuilt); indexing the corpus"
+        )
+        skip_index = False
+
     async with (
         build_simple_stack(
-            collection_name="multihop_rag", persist_dir=store_dir
+            collection_name="multihop_rag",
+            persist_dir=store_dir,
+            use_hybrid=use_hybrid,
         ) as s,
         AsyncExitStack() as extra,
     ):
@@ -545,6 +576,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip corpus indexing (use when the collection is already populated)",
     )
     p_mh.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Use hybrid dense+BM25 retrieval fused with RRF (technique A1). "
+        "Forces a full re-index since the BM25 index is in-memory.",
+    )
+    p_mh.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -608,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_index=args.skip_index,
                     limit=args.limit,
                     persist_dir=args.persist_dir,
+                    use_hybrid=args.hybrid,
                     output_file=args.output
                 )
             )
