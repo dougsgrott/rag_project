@@ -90,6 +90,7 @@ async def build_simple_stack(
     persist_dir: str | None = None,
     use_hybrid: bool = False,
     use_multi_query: bool = False,
+    use_hyde: bool = False,
 ) -> AsyncIterator[SimpleStack]:
     """Build and yield the fully-wired simple stack.
 
@@ -111,6 +112,11 @@ async def build_simple_stack(
     A2) — the stack's `Generator` expands each query into several variants whose
     results are RRF-fused. It composes on top of `use_hybrid` (the inner store is
     then the hybrid one).
+
+    `use_hyde` wraps the retriever in a `HyDERetriever` (technique A3) — the
+    stack's `Generator` drafts a hypothetical answer passage that is embedded for
+    retrieval in place of the raw query. It is the outermost wrapper, composing on
+    top of `use_hybrid` / `use_multi_query`.
     """
     settings = settings or Settings()
     if not settings.openai_api_key:
@@ -130,9 +136,10 @@ async def build_simple_stack(
             )
         )
         # Build the retrieval stack inner-to-outer: dense → (optional hybrid) →
-        # (optional multi-query). Each wrapper delegates lifecycle to the store
-        # it wraps, so only the outermost is entered here.
-        inner_store: VectorStore = ChromaVectorStore(
+        # (optional multi-query) → (optional HyDE). Each wrapper delegates
+        # lifecycle to the store it wraps, so entering the outermost cascades
+        # down and only that one is entered here.
+        vector_store: VectorStore = ChromaVectorStore(
             embedder=embedder,
             collection_name=collection_name,
             persist_dir=persist_dir or settings.chroma_persist_dir,
@@ -143,20 +150,19 @@ async def build_simple_stack(
             from rag.adapters.hybrid.vector_store import HybridVectorStore
             from rag.adapters.local.bm25_vector_store import BM25VectorStore
 
-            inner_store = HybridVectorStore(
-                dense=inner_store, sparse=BM25VectorStore()
+            vector_store = HybridVectorStore(
+                dense=vector_store, sparse=BM25VectorStore()
             )
-        vector_store: VectorStore
         if use_multi_query:
             from rag.adapters.generic.multi_query_retriever import MultiQueryRetriever
 
-            vector_store = await stack.enter_async_context(
-                MultiQueryRetriever(inner=inner_store, generator=generator)
-            )
-        elif isinstance(inner_store, AbstractAsyncContextManager):
-            vector_store = await stack.enter_async_context(inner_store)
-        else:
-            vector_store = inner_store
+            vector_store = MultiQueryRetriever(inner=vector_store, generator=generator)
+        if use_hyde:
+            from rag.adapters.generic.hyde_retriever import HyDERetriever
+
+            vector_store = HyDERetriever(inner=vector_store, generator=generator)
+        if isinstance(vector_store, AbstractAsyncContextManager):
+            vector_store = await stack.enter_async_context(vector_store)
         conversation_store = await stack.enter_async_context(
             SQLiteConversationStore(path=settings.sqlite_path)
         )
@@ -420,6 +426,7 @@ async def _run_evaluate_multihop(
     persist_dir: str | None,
     use_hybrid: bool = False,
     use_multi_query: bool = False,
+    use_hyde: bool = False,
     output_file: str | None = None,
 ) -> None:
     """Index the MultiHop-RAG corpus, run the eval set, slice by question_type.
@@ -435,9 +442,9 @@ async def _run_evaluate_multihop(
     re-embedding the Chroma store) cannot apply: it is ignored under `--hybrid`,
     and a full ingest runs so both stores are populated.
 
-    `use_multi_query` selects the A2 multi-query expansion retriever; it composes
-    with `use_hybrid`. It only changes query-time behaviour, so `--skip-index`
-    still applies to it.
+    `use_multi_query` selects the A2 multi-query expansion retriever and
+    `use_hyde` the A3 HyDE retriever; both compose with `use_hybrid` and only
+    change query-time behaviour, so `--skip-index` still applies to them.
     """
     from pathlib import Path
     from datetime import datetime
@@ -462,6 +469,7 @@ async def _run_evaluate_multihop(
             persist_dir=store_dir,
             use_hybrid=use_hybrid,
             use_multi_query=use_multi_query,
+            use_hyde=use_hyde,
         ) as s,
         AsyncExitStack() as extra,
     ):
@@ -611,6 +619,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "results (technique A2). Composes with --hybrid.",
     )
     p_mh.add_argument(
+        "--hyde",
+        action="store_true",
+        help="Retrieve on an LLM-drafted hypothetical answer passage instead of "
+        "the raw query (technique A3). Composes with --hybrid / --multi-query.",
+    )
+    p_mh.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -676,6 +690,7 @@ def main(argv: list[str] | None = None) -> int:
                     persist_dir=args.persist_dir,
                     use_hybrid=args.hybrid,
                     use_multi_query=args.multi_query,
+                    use_hyde=args.hyde,
                     output_file=args.output
                 )
             )
